@@ -9,6 +9,7 @@ import torch.backends.cudnn as cudnn
 import torch.optim as optim
 import torch.utils.data
 import numpy as np
+import MDAnalysis as mda
 import re
 from string import ascii_uppercase, ascii_lowercase
 from math import sqrt
@@ -24,7 +25,7 @@ from colabfold.batch import get_queries, run, set_model_type
 
 from colabfold.colabfold import plot_protein
 from pathlib import Path
-
+import argparse
 
 def fxn():
     warnings.warn("deprecated", DeprecationWarning)
@@ -32,6 +33,20 @@ def fxn():
 with warnings.catch_warnings():
     warnings.simplefilter("ignore")
     fxn()
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generator-based peptide design with AlphaFold feedback"
+    )
+    parser.add_argument("--rec_seq", type=str, required=True,
+                        help="FASTA file containing receptor sequence")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--num_seqs", type=int, default=20)
+    parser.add_argument("--peptide_length", type=int, default=20)
+    parser.add_argument("--output", type=str, default="Khondamir_results.txt")  
+    parser.add_argument("--hotspots", type=str, default="")  
+    return parser.parse_args()
+
 
 # Set random seed for reproducibility
 manualSeed = 999
@@ -45,32 +60,23 @@ workers = 2
 
 # Batch size during training
 batch_size = 128
-
 # Spatial size of training images. All images will be resized to this
 #   size using a transformer.
 image_size = 64
-
-# Number of channels in the training images. For color images this is 3
+# Number of channels in the training images.
 nc = 1
-
 # Size of z latent vector (i.e. size of generator input)
 nz = 100
-
 # Size of feature maps in generator
 ngf = 64
-
 # Size of feature maps in discriminator
 ndf = 64
-
 # Number of training epochs
 num_epochs = 1000
-
 # Learning rate for optimizers
 lr = 0.0001
-
 # Beta1 hyperparam for Adam optimizers
 beta1 = 0.5
-
 # Number of GPUs available. Use 0 for CPU mode.
 ngpu = 1
 
@@ -161,7 +167,6 @@ def alphafold_predict(sequence, epoch, item):
   use_amber = False 
   template_mode = "custom" 
   
-
   custom_template_path = 'custom_template'
   use_templates = True
 
@@ -220,10 +225,31 @@ a_dict={}
 for i, aaa in enumerate(aminoacid_list):
   a_dict[aaa]=i
 
+def read_fasta_sequence(fasta_path):
+    """
+    Read first sequence from FASTA file.
+    """
+    sequence = []
 
-def numpy_to_seq(array, seq_len, oligomer=1):
+    with open(fasta_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith(">"):
+                continue
+            sequence.append(line)
+
+    if not sequence:
+        raise ValueError(f"No sequence found in FASTA file: {fasta_path}")
+
+    seq = "".join(sequence).upper()
+    return seq
+
+
+def numpy_to_seq(array, seq_len, sequence, oligomer=1):
   sequence = []
-  receptor = 'GSNKTVVVTTILESPYVMMKKNHEMLEGNERYEGYCVDLAAEIAKHCGFKYKLTIVGDGKYGARDADTKIWNGMVGELVYGKADIAIAPLTITLVREEVIDFSKPFMSLGISIMIKKGTPIESAEDLSKQTEIAYGTLDSGSTKEFFRRSKIAVFDKMWTYMRSAEPSVFVRTTAEGVARVRKSKGKYAYLLESTMNEYIEQRKPCDTMKVGGNLDSKGYGIATPKGSSLRNAVNLAVLKLNEQGLLDKLKNKWWYDKGECGS'
+  receptor = sequence
   array = array.cpu().detach().numpy()
   for i in array:
     seq=''
@@ -240,42 +266,47 @@ def numpy_to_seq(array, seq_len, oligomer=1):
 #target_a = np.load('hal.npy')
 
 
-def take_loss(target_pdb_name, seq_len, epoch):
-  all_loss = [take_loss1(f'{target_pdb_name}{epoch}_{i}_unrelaxed_rank_1_model_1.pdb') for i in range(seq_len)]
+def take_loss(target_pdb_name, seq_len, epoch, hotspots=''):
+  all_loss = [take_loss1(f'{target_pdb_name}{epoch}_{i}_unrelaxed_rank_1_model_1.pdb', hotspots) for i in range(seq_len)]
   true_tensor = [0 for i in range(seq_len)]
   return torch.tensor(true_tensor).float(), torch.tensor(all_loss).float()
 
 
-def take_loss1(filename):
-  with open(filename) as ifile:
-      system = "".join([x for x in ifile])
-  system1 = system.split("\n")
-  system2 = []
-  for x in system1:
-    if x[:4] == 'ATOM':
-      system2.append(x)
-  CAS = [x for x in system2 if "CA" in x]
-  CAS = [x.split(' ') for x in CAS]
-  CAS = [[x for x in y if x!=''] for y in CAS ]
-  CAS_A = [x for x in CAS if x[4]=='B']
-  CAS_B = [x for x in CAS if x[4]=='C']
+def take_loss1(filename, hotspots=''):
+    """
+    Compute distance between the center of CA atoms of peptide (chain B)
+    and selected residues of receptor (chain C) using MDAnalysis.
+    """
+
+    # Load structure
+    u = mda.Universe(filename)
+
+    # Select CA atoms for peptide (chain B) and receptor (chain C)
+    peptide = u.select_atoms("chainID B and name CA")
+    receptor_all = u.select_atoms("chainID C and name CA")
+
+    # Select specific receptor residues (as in your original code)
+    # Residue indices are 1-based in MDAnalysis; adjust if needed
+    selected_indices = [int(i) for i in hotspots.split(',')]  # corresponds to CAS_B indices in original
+    receptor = receptor_all[selected_indices]
+
+    # Compute geometric centers
+    peptide_center = peptide.positions.mean(axis=0)
+    receptor_center = receptor_all.positions.mean(axis=0)
+
+    # Euclidean distance
+    loss = np.linalg.norm(peptide_center - receptor_center)
+    return loss
 
 
-  CAS_A = np.array([np.array([float(x[6]), float(x[7]), float(x[8])]) for x in CAS_A])
 
-  CAS_B = np.array([np.array([float(x[6]), float(x[7]), float(x[8])]) for x in CAS_B])
-
-  CAS_B = np.array([CAS_B[50],CAS_B[51],CAS_B[52],CAS_B[53],CAS_B[54],CAS_B[26],CAS_B[27],CAS_B[28],CAS_B[29],CAS_B[30],CAS_B[31],CAS_B[32]])
-
-  receptor_center = (sum([i for i in CAS_B]))/CAS_B.shape[0]
-  peptide_center = (sum([i for i in CAS_A]))/CAS_A.shape[0]
-  loss = sqrt(np.sum((peptide_center-receptor_center)**2))
-  return loss
-
-
-
-def training(num_epochs=10, num_seqs=20, peptide_length=10):
-    # Training Loop
+def training(args):
+    #Training loop
+    num_epochs = args.epochs
+    num_seqs = args.num_seqs
+    peptide_length = args.peptide_length
+    rec_seq = args.rec_seq
+    hotspots = args.hotspots
     img_list = []
     G_losses = []
     predicted_losses_list = []
@@ -288,7 +319,7 @@ def training(num_epochs=10, num_seqs=20, peptide_length=10):
         start = time.time()
         # For each batch in the dataloader
         fake = netG(torch.randn(num_seqs, nz, 1, 1, device=device))
-        fake = numpy_to_seq(fake, peptide_length)
+        fake = numpy_to_seq(fake, peptide_length, rec_seq)
         img_list.append(fake)
         for z, x in enumerate(fake):
           alphafold(x, epoch, z)
@@ -296,7 +327,7 @@ def training(num_epochs=10, num_seqs=20, peptide_length=10):
         optimizerG.zero_grad()
 
         # Calculate G's loss based on this output
-        target, pred_loss = take_loss('tmp', num_seqs, epoch)
+        target, pred_loss = take_loss('tmp', num_seqs, epoch, hotspots)
         errG = criterion(target, pred_loss).requires_grad_(True)
         print(errG)
         # Calculate gradients for G
@@ -312,8 +343,7 @@ def training(num_epochs=10, num_seqs=20, peptide_length=10):
         G_losses.append(errG.item())
         predicted_losses_list.append(pred_loss)
 
-
-        file = open('Khondamir_results.txt', 'w')
+        file = open(args.output, 'w')
         for i, x in enumerate(img_list):
             file.write('\n'+str(G_losses[i])+'\n')
 
@@ -324,4 +354,11 @@ def training(num_epochs=10, num_seqs=20, peptide_length=10):
         file.close()
 
 
-training(50, 20, 20)
+def main():
+    args = parse_args()
+    train(args)
+
+
+if __name__ == "__main__":
+    main()
+
